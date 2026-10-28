@@ -1,0 +1,32 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v5
+
+      - name: Build
+        run: ./gradlew --no-daemon assembleRelease
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=$(git rev-parse --short=7 HEAD)
+          cp app/build/outputs/apk/release/app-release.apk "wifitile-$TAG.apk"
+          gh release create "$TAG" "wifitile-$TAG.apk" --target "$GITHUB_SHA" --title "$TAG" --generate-notes
