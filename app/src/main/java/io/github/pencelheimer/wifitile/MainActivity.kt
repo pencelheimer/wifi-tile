@@ -2,7 +2,9 @@ package io.github.pencelheimer.wifitile
 
 import android.app.StatusBarManager
 import android.content.ComponentName
+import android.content.Intent
 import android.graphics.drawable.Icon
+import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -29,23 +31,43 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
-import rikka.shizuku.Shizuku
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import eu.darken.porter.sdk.PermissionState
+import eu.darken.porter.sdk.Porter
+import eu.darken.porter.sdk.PorterAvailability
+import eu.darken.porter.sdk.PorterConnection
+import eu.darken.porter.sdk.PorterConnectionState
+import eu.darken.porter.sdk.PorterException
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
-    private var running by mutableStateOf(false)
-    private var granted by mutableStateOf(false)
-    private var tileAdded by mutableStateOf(false)
+    /** What Porter needs from the user; a null [onAction] disables the button, a null [action] hides it. */
+    private class Setup(val status: String, val action: String? = null, val onAction: (() -> Unit)? = null)
 
-    private val onBinder = Shizuku.OnBinderReceivedListener { refresh() }
-    private val onDead = Shizuku.OnBinderDeadListener { refresh() }
-    private val onResult = Shizuku.OnRequestPermissionResultListener { _, _ -> refresh() }
+    private var setup by mutableStateOf(Setup("Checking Porter…"))
+    private var tileAdded by mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        Shizuku.addBinderReceivedListenerSticky(onBinder)
-        Shizuku.addBinderDeadListener(onDead)
-        Shizuku.addRequestPermissionResultListener(onResult)
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                Porter.state.collectLatest { state ->
+                    if (state !is PorterConnectionState.Connected) {
+                        setup = describe(availability())
+                        return@collectLatest
+                    }
+                    try {
+                        state.connection.checkPermission()
+                    } catch (e: PorterException) {
+                    }
+                    state.connection.permission.collect { setup = describe(state.connection, it) }
+                }
+            }
+        }
 
         setContent {
             val colors = if (isSystemInDarkTheme()) dynamicDarkColorScheme(this) else dynamicLightColorScheme(this)
@@ -57,19 +79,15 @@ class MainActivity : ComponentActivity() {
                         horizontalAlignment = Alignment.CenterHorizontally,
                     ) {
                         Text("Wi-Fi Tile", style = MaterialTheme.typography.displaySmall)
-                        Text(
-                            when {
-                                !running -> "Shizuku is not running"
-                                !granted -> "Shizuku permission required"
-                                else -> "Ready"
-                            },
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                        FilledTonalButton(
-                            onClick = { Shizuku.requestPermission(0) },
-                            enabled = running && !granted,
-                            shapes = ButtonDefaults.shapes(),
-                        ) { Text(if (granted) "Shizuku granted" else "Grant Shizuku") }
+                        Text(setup.status, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        setup.action?.let { action ->
+                            val onAction = setup.onAction
+                            FilledTonalButton(
+                                onClick = { onAction?.invoke() },
+                                enabled = onAction != null,
+                                shapes = ButtonDefaults.shapes(),
+                            ) { Text(action) }
+                        }
                         Button(onClick = ::addTile, enabled = !tileAdded, shapes = ButtonDefaults.shapes()) {
                             Text(if (tileAdded) "Tile added" else "Add tile")
                         }
@@ -84,17 +102,52 @@ class MainActivity : ComponentActivity() {
         refresh()
     }
 
-    override fun onDestroy() {
-        Shizuku.removeBinderReceivedListener(onBinder)
-        Shizuku.removeBinderDeadListener(onDead)
-        Shizuku.removeRequestPermissionResultListener(onResult)
-        super.onDestroy()
+    private fun refresh() {
+        tileAdded = WifiTileService.isAdded(this)
     }
 
-    private fun refresh() {
-        running = Shizuku.pingBinder()
-        granted = Shell.ready
-        tileAdded = WifiTileService.isAdded(this)
+    private suspend fun availability(): PorterAvailability? = try {
+        Porter.availability(this)
+    } catch (e: PorterException) {
+        null
+    }
+
+    private fun describe(availability: PorterAvailability?) = when (availability) {
+        PorterAvailability.NotInstalled -> Setup("Porter is not installed", "Get Porter") { open(Intent(Intent.ACTION_VIEW, Uri.parse(SETUP_URL))) }
+        is PorterAvailability.InstalledNotConnected -> Setup("Porter is not running", "Open Porter") { openApp(availability.packageName) }
+        is PorterAvailability.InstalledUnrecognized -> Setup("An unrecognized app holds Porter's permission")
+        is PorterAvailability.Incompatible ->
+            if (availability.incompatibility.serverTooOld) {
+                Setup("Porter needs an update", "Open Porter", availability.packageName?.let { pkg -> { openApp(pkg) } })
+            } else {
+                Setup("Wi-Fi Tile needs an update to work with this Porter")
+            }
+        is PorterAvailability.Connected, null -> Setup("Connecting to Porter…")
+    }
+
+    private fun describe(connection: PorterConnection, permission: PermissionState) = when (permission) {
+        PermissionState.Granted -> Setup("Ready", "Porter granted")
+        is PermissionState.Denied ->
+            if (permission.permanentlyDenied) {
+                Setup("Access denied, allow Wi-Fi Tile in Porter")
+            } else {
+                Setup("Porter permission required", "Grant Porter") {
+                    lifecycleScope.launch {
+                        try {
+                            connection.requestPermission() // the result arrives on connection.permission
+                        } catch (e: PorterException) { // includes Porter restarting while the dialog was up
+                        }
+                    }
+                }
+            }
+    }
+
+    private fun openApp(packageName: String) {
+        packageManager.getLaunchIntentForPackage(packageName)?.let(::open)
+    }
+
+    private fun open(intent: Intent) {
+        runCatching { startActivity(intent) }
     }
 
     private fun addTile() {
@@ -111,5 +164,9 @@ class MainActivity : ComponentActivity() {
                 refresh()
             }
         }
+    }
+
+    private companion object {
+        const val SETUP_URL = "https://porter.darken.eu/setup"
     }
 }
