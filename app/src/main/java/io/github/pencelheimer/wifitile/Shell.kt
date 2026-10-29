@@ -1,21 +1,29 @@
 package io.github.pencelheimer.wifitile
 
-import android.content.pm.PackageManager
-import rikka.shizuku.Shizuku
+import eu.darken.porter.sdk.Porter
+import eu.darken.porter.sdk.PorterException
+import eu.darken.porter.sdk.isGranted
+import eu.darken.porter.sdk.extras.exec
+import kotlinx.coroutines.withTimeout
 
 object Shell {
-    val ready: Boolean
-        get() = Shizuku.pingBinder() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
-
-    fun run(vararg cmd: String): String {
-        @Suppress("DEPRECATION") // NOTE(pencelheimer): made private in API 13; API 12.x is pinned to keep calling it directly
-        val process = Shizuku.newProcess(cmd, null, null)
-        return process.inputStream.bufferedReader().use { it.readText() }.also { process.waitFor() }
+    suspend fun ready(): Boolean {
+        val connection = Porter.connection.value ?: return false
+        return try {
+            connection.checkPermission().isGranted
+        } catch (e: PorterException) {
+            false
+        }
     }
 
-    fun setWifi(enabled: Boolean) =
+    private suspend fun run(vararg cmd: String): String {
+        val connection = checkNotNull(Porter.connection.value) { "Porter is not connected" }
+        return withTimeout(5_000) { connection.exec(*cmd) }.output
+    }
+
+    suspend fun setWifi(enabled: Boolean) =
         run("svc", "wifi", if (enabled) "enable" else "disable")
 
-    fun ssid(): String? =
+    suspend fun ssid(): String? =
         Regex("""connected to "(.+?)"""").find(run("cmd", "wifi", "status"))?.groupValues?.get(1)
 }
